@@ -1,3 +1,195 @@
+"""Laboratorio RAG educativo — Streamlit + Gemini + Pinecone.
+
+Objetivo: permitir que una persona cargue documentos, los convierta en
+embeddings, almacene esos vectores en Pinecone y consulte su contenido
+mediante un chat respaldado por los fragmentos recuperados (RAG).
+
+Flujo: subir archivo -> extraer texto -> fragmentar -> generar embeddings ->
+indexar en Pinecone -> formular pregunta -> búsqueda semántica -> Gemini.
+
+Este archivo conserva la lógica de la versión que funcionó para el usuario.
+Requisitos externos: GEMINI_API_KEY y PINECONE_API_KEY en Streamlit Secrets.
+"""
+# Módulos estándar: manejo de archivos en memoria, limpieza de nombres e IDs.
+import io
+import re
+import uuid
+import unicodedata
+
+# Dependencias externas: interfaz, lectura de documentos, IA y base vectorial.
+import streamlit as st
+from docx import Document
+from google import genai
+from google.genai import types
+from pinecone import Pinecone, ServerlessSpec
+from pypdf import PdfReader
+
+# Configuración de la pestaña del navegador y ancho de la aplicación.
+st.set_page_config(page_title="Laboratorio RAG | Gemini + Pinecone", page_icon="🧠", layout="wide")
+
+# Configuración central. EMBED_MODEL convierte texto a vectores;
+# CHAT_MODEL redacta respuestas. Pinecone debe coincidir con DIMENSIONS.
+# Cambiar el modelo de embeddings podría requerir otro índice y reindexación.
+EMBED_MODEL = "gemini-embedding-001"
+CHAT_MODEL = "gemini-3.5-flash"   
+INDEX_NAME = "documentos-tae2026-01"
+DIMENSIONS = 3072
+
+
+def extraer_texto(archivo):
+    """Extrae texto de un archivo subido por Streamlit.
+
+    Admite PDF con texto extraíble, DOCX y TXT. No realiza OCR: un PDF
+    escaneado sin capa de texto puede devolver una cadena vacía.
+    """
+    datos = archivo.getvalue()
+    nombre = archivo.name.lower()
+    if nombre.endswith(".pdf"):
+        return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(datos)).pages)
+    if nombre.endswith(".docx"):
+        return "\n".join(p.text for p in Document(io.BytesIO(datos)).paragraphs)
+    if nombre.endswith(".txt"):
+        try:
+            return datos.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return datos.decode("latin-1")
+    raise ValueError("Formato no admitido")
+
+
+def crear_chunks(texto, max_chars=350):
+    """Divide el texto en fragmentos aproximados usando puntos como separador.
+
+    Agrupa frases hasta acercarse a max_chars (350 por defecto).
+    No garantiza el límite si una sola frase es más larga.
+    """
+    partes = texto.split(".")
+    resultado, actual = [], ""
+    for parte in partes:
+        parte = parte.strip()
+        if not parte:
+            continue
+        frase = parte + ". "
+        if len(actual) + len(frase) < max_chars:
+            actual += frase
+        else:
+            if actual.strip():
+                resultado.append(actual.strip())
+            actual = frase
+    if actual.strip():
+        resultado.append(actual.strip())
+    return resultado
+
+
+def limpiar_id(texto):
+    """Convierte un nombre de archivo en parte segura de un identificador.
+
+    Elimina acentos y sustituye caracteres especiales por guiones bajos.
+    """
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_-]", "_", texto)).strip("_") or "documento"
+
+
+# Reutiliza los clientes entre ejecuciones del script (reruns de Streamlit).
+@st.cache_resource(show_spinner=False)
+def clientes(api_gemini, api_pinecone):
+    """Inicializa los clientes de Google Gemini y Pinecone con claves API."""
+    return genai.Client(api_key=api_gemini), Pinecone(api_key=api_pinecone)
+
+
+def obtener_index(pc):
+    """Obtiene el índice vectorial; lo crea si aún no existe.
+
+    El índice usa similitud coseno, 3072 dimensiones y Pinecone Serverless
+    en AWS us-east-1. Si existe, se reutiliza sin modificar su configuración.
+    """
+    if INDEX_NAME not in pc.list_indexes().names():
+        pc.create_index(
+            name=INDEX_NAME, dimension=DIMENSIONS, metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+    indice = pc.Index(INDEX_NAME)
+    return indice
+
+
+def indexar_archivos(archivos, gemini, indice, namespace, barra):
+    """Procesa archivos y almacena sus embeddings en Pinecone.
+
+    Por archivo: extrae texto, fragmenta, genera un embedding por fragmento
+    y envía lotes de hasta 25 vectores. Cada vector guarda metadatos del
+    documento y del fragmento. Devuelve cantidad indexada, fallos y mensajes.
+    """
+    total, fallos, detalle = 0, 0, []
+    total_archivos = len(archivos)
+    for numero, archivo in enumerate(archivos, 1):
+        try:
+            texto = extraer_texto(archivo)
+            if not texto.strip():
+                detalle.append(f"⚠️ {archivo.name}: no se extrajo texto (PDF escaneado requiere OCR).")
+                continue
+            chunks = crear_chunks(texto)
+            if not chunks:
+                detalle.append(f"⚠️ {archivo.name}: no hay fragmentos que indexar.")
+                continue
+            lote = []
+            doc_id = limpiar_id(archivo.name) + "-" + uuid.uuid4().hex[:8]
+            # Cada llamada transforma un fragmento en un vector numérico.
+            for i, chunk in enumerate(chunks):
+                resultado = gemini.models.embed_content(model=EMBED_MODEL, contents=chunk)
+                lote.append({
+                    "id": f"{doc_id}-{i}",
+                    "values": resultado.embeddings[0].values,
+                    "metadata": {"texto": chunk, "doc": archivo.name, "chunk": i},
+                })
+                # Se envían grupos de 25 vectores para reducir operaciones.
+                if len(lote) == 25:
+                    indice.upsert(vectors=lote, namespace=namespace)
+                    total += len(lote)
+                    lote = []
+            if lote:
+                indice.upsert(vectors=lote, namespace=namespace)
+                total += len(lote)
+            detalle.append(f"✅ {archivo.name}: {len(chunks)} fragmentos procesados.")
+        except Exception as e:
+            fallos += 1
+            detalle.append(f"❌ {archivo.name}: {str(e)}")
+        barra.progress(numero / total_archivos)
+    return total, fallos, detalle
+
+
+def buscar(indice, gemini, pregunta, namespace, k=4):
+    """Recupera hasta k fragmentos relevantes para la pregunta.
+
+    La pregunta se convierte en embedding y Pinecone busca vectores
+    parecidos dentro del namespace de la sesión actual.
+    """
+    embedding = gemini.models.embed_content(model=EMBED_MODEL, contents=pregunta)
+    consulta = indice.query(
+        vector=embedding.embeddings[0].values,
+        top_k=k, include_metadata=True, namespace=namespace
+    )
+    encontrados = []
+    for item in consulta.matches:
+        meta = item.metadata or {}
+        if meta.get("texto"):
+            encontrados.append({
+                "documento": meta.get("doc", "Sin nombre"),
+                "fragmento": meta["texto"],
+                "similitud": float(item.score) if item.score is not None else None,
+            })
+    return encontrados
+
+
+def responder(gemini, pregunta, fragmentos):
+    """Solicita a Gemini una respuesta basada en los fragmentos recuperados.
+
+    El prompt le pide responder solo con el contexto disponible; esto
+    reduce la invención de contenido, pero no constituye una garantía.
+    """
+    contexto = "\n\n".join(x["fragmento"] for x in fragmentos)
+    if not contexto.strip():
+        return "No encontré información en los documentos cargados para responder esa pregunta."
+    prompt = f"""Usa EXCLUSIVAMENTE el siguiente contexto para responder.
+CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta}\n\nINSTRUCCIONES:
 - No inventes información.
 - No agregues detalles que no estén en el contexto.
 - Responde de forma clara y directa.
