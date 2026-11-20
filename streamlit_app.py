@@ -14,7 +14,7 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Laboratorio RAG | Gemini + Pinecone", page_icon="🧠", layout="wide")
 
 EMBED_MODEL = "gemini-embedding-001"
-CHAT_MODEL = "gemini-2.5-flash"
+CHAT_MODEL = "gemini-3.5-flash"
 INDEX_NAME = "documentos-tae2026-01"
 DIMENSIONS = 3072
 
